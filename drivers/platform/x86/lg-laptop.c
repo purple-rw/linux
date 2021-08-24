@@ -8,6 +8,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/acpi.h>
+#include <linux/dmi.h>
 #include <linux/input.h>
 #include <linux/input/sparse-keymap.h>
 #include <linux/kernel.h>
@@ -26,6 +27,9 @@
 MODULE_AUTHOR("Matan Ziv-Av");
 MODULE_DESCRIPTION("LG WMI Hotkey Driver");
 MODULE_LICENSE("GPL");
+MODULE_VERSION("1.0.1");
+
+#define BUFFER_SIZE 16
 
 #define WMI_EVENT_GUID0	"E4FB94F9-7F2B-4173-AD1A-CD1D95086248"
 #define WMI_EVENT_GUID1	"023B133E-49D1-4E10-B313-698220140DC2"
@@ -67,7 +71,12 @@ static u32 inited;
 #define INIT_INPUT_WMI_0        0x01
 #define INIT_INPUT_WMI_2        0x02
 #define INIT_INPUT_ACPI         0x04
+#define INIT_TPAD_LED           0x08
+#define INIT_KBD_LED            0x10
+#define INIT_RDMODE_LED         0x20
 #define INIT_SPARSE_KEYMAP      0x80
+
+static int battery_limit_use_wmbb;
 
 static const struct key_entry wmi_keymap[] = {
 	{KE_KEY, 0x70, {KEY_F15} },	 /* LG control panel (F1) */
@@ -293,9 +302,7 @@ static ssize_t fan_mode_store(struct device *dev,
 
 	m = r->integer.value;
 	kfree(r);
-	r = lg_wmab(WM_FAN_MODE, WM_SET, (m & 0xffffff0f) | (value << 4));
-	kfree(r);
-	r = lg_wmab(WM_FAN_MODE, WM_SET, (m & 0xfffffff0) | value);
+	r = lg_wmab(WM_FAN_MODE, WM_SET, (m & 0xffffff0f) | (value << 4) | value);
 	kfree(r);
 
 	return count;
@@ -403,7 +410,7 @@ static ssize_t reader_mode_show(struct device *dev,
 
 	kfree(r);
 
-	return snprintf(buffer, PAGE_SIZE, "%d\n", status);
+	return snprintf(buffer, BUFFER_SIZE, "%d\n", status);
 }
 
 static ssize_t fn_lock_store(struct device *dev,
@@ -461,7 +468,11 @@ static ssize_t battery_care_limit_store(struct device *dev,
 	if (value == 100 || value == 80) {
 		union acpi_object *r;
 
-		r = lg_wmab(WM_BATT_LIMIT, WM_SET, value);
+		if (!battery_limit_use_wmbb)
+			r = lg_wmab(WM_BATT_LIMIT, WM_SET, value);
+		else
+			r = lg_wmbb(WMBB_BATT_LIMIT, WM_SET, value);
+
 		if (!r)
 			return -EIO;
 
@@ -479,16 +490,31 @@ static ssize_t battery_care_limit_show(struct device *dev,
 	unsigned int status;
 	union acpi_object *r;
 
-	r = lg_wmab(WM_BATT_LIMIT, WM_GET, 0);
-	if (!r)
-		return -EIO;
+	if (!battery_limit_use_wmbb) {
+		r = lg_wmab(WM_BATT_LIMIT, WM_GET, 0);
+        pr_info("in wmab");
+		if (!r)
+			return -EIO;
 
-	if (r->type != ACPI_TYPE_INTEGER) {
-		kfree(r);
-		return -EIO;
+		if (r->type != ACPI_TYPE_INTEGER) {
+			kfree(r);
+			return -EIO;
+		}
+
+		status = r->integer.value;
+	} else {
+		r = lg_wmbb(WMBB_BATT_LIMIT, WM_GET, 0);
+        pr_info("in wmbb");
+		if (!r)
+			return -EIO;
+
+		if (r->type != ACPI_TYPE_BUFFER) {
+			kfree(r);
+			return -EIO;
+		}
+
+		status = r->buffer.pointer[0x10];
 	}
-
-	status = r->integer.value;
 	kfree(r);
 	if (status != 80 && status != 100)
 		status = 0;
@@ -505,9 +531,9 @@ static DEVICE_ATTR_RW(battery_care_limit);
 static struct attribute *dev_attributes[] = {
 	&dev_attr_fan_mode.attr,
 	&dev_attr_usb_charge.attr,
-	&dev_attr_reader_mode.attr,
 	&dev_attr_fn_lock.attr,
 	&dev_attr_battery_care_limit.attr,
+	&dev_attr_reader_mode.attr, // This is last, to be easily removed
 	NULL
 };
 
@@ -530,6 +556,22 @@ static enum led_brightness tpad_led_get(struct led_classdev *cdev)
 }
 
 static LED_DEVICE(tpad_led, 1);
+
+static void reader_mode_led_set(struct led_classdev *cdev,
+				enum led_brightness brightness)
+{
+	reader_mode_store(NULL, NULL, brightness == LED_OFF ? "0" : "1", 1);
+}
+
+static enum led_brightness reader_mode_led_get(struct led_classdev *cdev)
+{
+	char buf[BUFFER_SIZE];
+
+	reader_mode_show(NULL, NULL, buf);
+	return buf[0] != '0';
+}
+
+static LED_DEVICE(reader_mode_led, 1);
 
 static void kbd_backlight_set(struct led_classdev *cdev,
 			      enum led_brightness brightness)
@@ -602,6 +644,8 @@ static struct platform_driver pf_driver = {
 static int acpi_add(struct acpi_device *device)
 {
 	int ret;
+	const char *product;
+	int year = 2017;
 
 	if (pf_device)
 		return 0;
@@ -620,13 +664,47 @@ static int acpi_add(struct acpi_device *device)
 		goto out_platform_registered;
 	}
 
+	product = dmi_get_system_info(DMI_PRODUCT_NAME);
+	if (strlen(product) > 4)
+		switch (product[4]) {
+		case '5':
+		case '6':
+			year = 2016;
+			break;
+		case '7':
+			year = 2017;
+			break;
+		case '8':
+			year = 2018;
+			break;
+		case '9':
+			year = 2019;
+			break;
+		default:
+			year = 2019;
+		}
+	pr_info("product: %s  year: %d  debug v4\n", product, year);
+
+	if (year >= 2019)
+		battery_limit_use_wmbb = 1;
+
+	if (year >= 2018)
+		dev_attributes[4] = NULL; // Remove reader mode special file.
+
 	ret = sysfs_create_group(&pf_device->dev.kobj, &dev_attribute_group);
 	if (ret)
 		goto out_platform_device;
 
-	/* LEDs are optional */
-	led_classdev_register(&pf_device->dev, &kbd_backlight);
-	led_classdev_register(&pf_device->dev, &tpad_led);
+	if (!led_classdev_register(&pf_device->dev, &kbd_backlight))
+		inited |= INIT_KBD_LED;
+
+	if (!led_classdev_register(&pf_device->dev, &tpad_led))
+		inited |= INIT_TPAD_LED;
+
+	// For 2018 and 2019 models, reader mode only controls the LED
+	if (year >= 2018)
+		if (!led_classdev_register(&pf_device->dev, &reader_mode_led))
+			inited |= INIT_RDMODE_LED;
 
 	wmi_input_setup();
 
@@ -642,9 +720,14 @@ out_platform_registered:
 static int acpi_remove(struct acpi_device *device)
 {
 	sysfs_remove_group(&pf_device->dev.kobj, &dev_attribute_group);
+	if (inited & INIT_KBD_LED)
+		led_classdev_unregister(&kbd_backlight);
 
-	led_classdev_unregister(&tpad_led);
-	led_classdev_unregister(&kbd_backlight);
+	if (inited & INIT_TPAD_LED)
+		led_classdev_unregister(&tpad_led);
+
+	if (inited & INIT_RDMODE_LED)
+		led_classdev_unregister(&reader_mode_led);
 
 	wmi_input_destroy();
 	platform_device_unregister(pf_device);
@@ -678,7 +761,7 @@ static int __init acpi_init(void)
 
 	result = acpi_bus_register_driver(&acpi_driver);
 	if (result < 0) {
-		pr_debug("Error registering driver\n");
+		ACPI_DEBUG_PRINT((ACPI_DB_ERROR, "Error registering driver\n"));
 		return -ENODEV;
 	}
 
